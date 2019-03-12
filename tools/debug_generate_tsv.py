@@ -7,8 +7,23 @@
 
 
 # Example:
-# ./tools/generate_tsv.py --gpu 0,1,2,3,4,5,6,7 --cfg experiments/cfgs/faster_rcnn_end2end_resnet.yml --def models/vg/ResNet-101/faster_rcnn_end2end/test.prototxt --out test2014_resnet101_faster_rcnn_genome.tsv --net data/faster_rcnn_models/resnet101_faster_rcnn_final.caffemodel --split coco_test2014
-
+# ./tools/generate_tsv.py --gpu 0,1,2,3,4,5,6,7 --cfg experiments/cfgs/faster_rcnn_end2end_resnet.yml --def models/vg/ResNet-101/faster_rcnn_end2end/test.prototxt --out test2014_resnet101_faster_rcnn_genome.tsv --caffe_net data/faster_rcnn_models/resnet101_faster_rcnn_final.caffemodel --split coco_test2014
+###################################################
+# Pytorch
+import re
+import caffe
+import numpy as np
+import skimage.io
+from caffe.proto import caffe_pb2
+import torch
+from torch.autograd import Variable
+import torchvision.models as models
+import torch.nn.functional as F
+import resnet_frcnn
+#from nets.resnet_v1 import resnet_v1
+from collections import OrderedDict
+from resnet_frcnn import resnet101
+###################################################
 
 import _init_paths
 from fast_rcnn.config import cfg, cfg_from_file
@@ -32,12 +47,12 @@ import json
 csv.field_size_limit(sys.maxsize)
 
 
-FIELDNAMES = ['image_id', 'image_w','image_h','num_boxes', 'boxes', 'features', 'max_conf']
+FIELDNAMES = ['image_id', 'image_w','image_h','num_boxes', 'boxes', 'roipool5', 'pool5', 'np_roipool5', 'np_pool5']
 
 # Settings for the number of features per image. To re-create pretrained features with 36 features
 # per image, set both values to 36. 
-MIN_BOXES = 100 #36 #10
-MAX_BOXES = 100 #36 #100
+MIN_BOXES = 36 #10
+MAX_BOXES = 36 #100
 
 def load_image_ids(split_name):
     ''' Load a list of (path,image_id tuples). Modify this to suit your data locations. '''
@@ -68,9 +83,6 @@ def load_image_ids(split_name):
         if len(imgids_val) > 0:
             cocoVal = COCO(valAnnoFile)
             imgs_val = cocoVal.loadImgs(imgids_val)
-        
-
-
 
         print "appending image_ids"
         for image_id in imgids:
@@ -93,28 +105,16 @@ def load_image_ids(split_name):
             if len(split) % 100 == 0:
                 print len(split)
     elif split_name.startswith('flickr30k'):
-        if split_name == 'flickr30k_test':
-            imglist = [l.rstrip().split('\t') for l in open('./data/flickr30k/ImageSets/test.txt')]
+        if split_name == 'flickr30k_val':
+            imglist = [l.rstrip().split('\t') for l in open('./data/flickr30k/ImageSets/val.txt')]
         elif split_name == 'flickr30k_val':
             imglist = [l.rstrip().split('\t') for l in open('./data/flickr30k/ImageSets/val.txt')]
         elif split_name == 'flickr30k_train':
             imglist = [l.rstrip().split('\t') for l in open('./data/flickr30k/ImageSets/train.txt')]
-        for img_name, image_id in imglist:
+        for img_name, image_id in imglist[:1]:
             filepath = os.path.join('./data/flickr30k/flickr30k_images/', img_name)
             print "filepath = {}, image_id = {}".format(filepath, image_id)
             split.append((filepath,image_id))
-    # elif split_name == 'flickr30k_test':
-        # imglist = [l.rstrip().split('\t') for l in open('./data/flickr30k/ImageSets/test.txt')]
-        # for img_name, image_id in imglist:
-          # filepath = os.path.join('./data/flickr30k/flickr30k_images/', img_name)
-          # print filepath
-          # split.append((filepath,image_id))
-    # elif split_name == 'flickr30k_train':
-        # imglist = [l.rstrip().split('\t') for l in open('./data/flickr30k/ImageSets/train.txt')]
-        # for img_name, image_id in imglist[:50]:
-          # filepath = os.path.join('./data/flickr30k/flickr30k_images/', img_name)
-          # print filepath
-          # split.append((filepath,image_id))
     elif split_name == 'coco_test2014':
       with open('/data/coco/annotations/image_info_test2014.json') as f:
         data = json.load(f)
@@ -140,23 +140,26 @@ def load_image_ids(split_name):
     return split
 
     
-def get_detections_from_im(net, im_file, image_id, conf_thresh=0.2):
-    print "get_detections_from_im: im_file = {}, image_id = {}".format(im_file, image_id)
+DEBUGFLAG = True
+def get_detections_from_im(caffe_net, pt_net, im_file, image_id, conf_thresh=0.2):
+    print "get_detections_from_im"
+    print im_file
+    print image_id
     im = cv2.imread(im_file)
-    scores, boxes, attr_scores, rel_scores = im_detect(net, im)
+    scores, boxes, attr_scores, rel_scores = im_detect(caffe_net, im)
 
     # Keep the original boxes, don't worry about the regresssion bbox outputs
-    rois = net.blobs['rois'].data.copy()
+    rois = caffe_net.blobs['rois'].data.copy()
     # unscale back to raw image space
     blobs, im_scales = _get_blobs(im, None)
 
     cls_boxes = rois[:, 1:5] / im_scales[0]
-    cls_prob = net.blobs['cls_prob'].data
-    #roipool5 = net.blobs['roipool5'].data
-    pool5 = net.blobs['pool5_flat'].data
-
+    cls_prob = caffe_net.blobs['cls_prob'].data
+    roipool5 = caffe_net.blobs['roipool5'].data
+    pool5 = caffe_net.blobs['pool5_flat'].data
+    
     # Keep only the best detections
-    max_conf = np.zeros((rois.shape[0])).astype(np.float32)
+    max_conf = np.zeros((rois.shape[0]))
     for cls_ind in range(1,cls_prob.shape[1]):
         cls_scores = scores[:, cls_ind]
         dets = np.hstack((cls_boxes, cls_scores[:, np.newaxis])).astype(np.float32)
@@ -168,19 +171,43 @@ def get_detections_from_im(net, im_file, image_id, conf_thresh=0.2):
         keep_boxes = np.argsort(max_conf)[::-1][:MIN_BOXES]
     elif len(keep_boxes) > MAX_BOXES:
         keep_boxes = np.argsort(max_conf)[::-1][:MAX_BOXES]
-    print "feature dim = {}".format(pool5[keep_boxes].shape)
-    print "max_conf[keep_boxes] = {}, type = {}".format(max_conf[keep_boxes], type(max_conf[keep_boxes]))
-    print "max_conf shape = {}".format(max_conf.shape)
-    print "max_conf[keep_boxes] shape = {}".format(max_conf[keep_boxes].shape)
-    return {
-        'image_id': image_id,
-        'image_h': np.size(im, 0),
-        'image_w': np.size(im, 1),
-        'num_boxes' : len(keep_boxes),
-        'boxes': base64.b64encode(cls_boxes[keep_boxes]),
-        'features': base64.b64encode(pool5[keep_boxes]),
-        'max_conf': base64.b64encode(max_conf[keep_boxes])
-    }
+    if DEBUGFLAG:
+        roipool5 = roipool5[keep_boxes]
+        pool5 = pool5[keep_boxes]
+        features = Variable(torch.from_numpy(roipool5))
+        #print("in features.size()= {}".format(features.size()))
+        if 1:
+            gt_roipool5_features = np.load('/home/chnxi/DoubleCrossAttVSE/roi_infeat_0.npy')
+            d = np.linalg.norm(gt_roipool5_features - roipool5)
+            print "d(gt_roipool5_features, caffe[roipool5= {}".format(d)
+            features = Variable(torch.from_numpy(gt_roipool5_features))
+        features = pt_net(features)      
+        print("out features.size()= {}".format(features.size()))
+        #features = features.view(batch_size, roiNum, -1)
+        print("features.size() before fc = {}".format(features.size()))
+        outfeat = features.data.numpy()
+        print "outfeat: type = {}, shape = {}".format(type(outfeat), outfeat.shape)
+        print "pool5: type = {}, shape = {}".format(type(pool5), pool5.shape)
+        d = np.linalg.norm(outfeat-pool5)
+        print "d = {}".format(d)
+        print outfeat
+        print pool5
+        debugPath = '/home/chnxi/DoubleCrossAttVSE/debug_bottom/'
+        np.save(debugPath + 'bn1.running_mean.npy', pt_net.layer4._modules['0'].bn1.running_mean.numpy())
+        np.save(debugPath + 'bn1.running_var.npy', pt_net.layer4._modules['0'].bn1.running_var.numpy())
+    else:
+        # print "roipool5 dim = {}".format(roipool5[keep_boxes].shape)
+        return {
+            'image_id': image_id,
+            'image_h': np.size(im, 0),
+            'image_w': np.size(im, 1),
+            'num_boxes' : len(keep_boxes),
+            'boxes': base64.b64encode(cls_boxes[keep_boxes]),
+            'roipool5': base64.b64encode(roipool5[keep_boxes]),
+            'pool5': base64.b64encode(pool5[keep_boxes]), 
+            'np_roipool5': roipool5[keep_boxes],
+            'np_pool5': pool5[keep_boxes]
+        }   
 
 
 def parse_args():
@@ -215,6 +242,18 @@ def parse_args():
     args = parser.parse_args()
     return args
 
+def get_torch_cnn(saved_model):
+    """Load a pretrained CNN and parallelize over GPUs
+    """
+    #saved_model = './data/torch/vg_resnet101.pth'
+    net = resnet101()
+    #net.create_architecture(21,tag='default', anchor_scales=[8, 16, 32])
+    print "Loading model {}".format(saved_model)
+    net.load_state_dict(torch.load(saved_model))
+    net.eval()
+    #net.cuda()
+    #net = nn.DataParallel(net).cuda()
+    return net
     
 def generate_tsv(gpu_id, prototxt, weights, image_ids, outfile):
     # First check if file exists, and if it is complete
@@ -245,16 +284,27 @@ def generate_tsv(gpu_id, prototxt, weights, image_ids, outfile):
     if len(missing) > 0:
         caffe.set_mode_gpu()
         caffe.set_device(gpu_id)
-        net = caffe.Net(prototxt, caffe.TEST, weights=weights)
+        caffe_net = caffe.Net(prototxt, caffe.TEST, weights=weights)
+        torch_model = '/home/chnxi/bottom-up-attention/data/torch/vg_resnet101.pth' #'./data/torch/vg_resnet101.pth'
+        pt_net = get_torch_cnn(torch_model)
+        out_roi_file = osp.join(outdir, 'tmp_roipool5.npy')
+        out_pool_file = osp.join(outdir, 'tmp_pool5.npy')
         with open(outfile, 'ab') as tsvfile:
             writer = csv.DictWriter(tsvfile, delimiter = '\t', fieldnames = FIELDNAMES)   
             _t = {'misc' : Timer()}
             count = 0
+            roi_data = []
+            pool_data = []
             for im_file,image_id in image_ids:
-                print "im_file = {}, image_id = {}".format(im_file, image_id)
-                if int(image_id) in missing:
+                print im_file
+                print image_id
+                if True: #int(image_id) in missing:
                     _t['misc'].tic()
-                    writer.writerow(get_detections_from_im(net, im_file, image_id))
+                    item = get_detections_from_im(caffe_net, pt_net, im_file, image_id)
+                    if not DEBUGFLAG:
+                        roi_data.append(item['np_roipool5'])
+                        pool_data.append(item['np_pool5'])
+                        writer.writerow(item)
                     _t['misc'].toc()
                     print "{}/{}".format(count+1, len(image_ids))
                     if (count % 100) == 0:
@@ -262,6 +312,9 @@ def generate_tsv(gpu_id, prototxt, weights, image_ids, outfile):
                               .format(gpu_id, count+1, len(missing), _t['misc'].average_time, 
                               _t['misc'].average_time*(len(missing)-count)/3600)
                     count += 1
+        if not DEBUGFLAG:
+            np.save(out_roi_file, np.stack(roi_data, axis=0))
+            np.save(out_pool_file, np.stack(pool_data, axis=0))
 
                     
 
@@ -282,8 +335,7 @@ def merge_tsvs():
                     except Exception as e:
                       print e                           
 
-                      
-     
+    
 if __name__ == '__main__':
 
     args = parse_args()

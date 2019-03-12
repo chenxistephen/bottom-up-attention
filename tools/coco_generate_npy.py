@@ -7,7 +7,7 @@
 
 
 # Example:
-# ./tools/generate_tsv.py --gpu 0,1,2,3,4,5,6,7 --cfg experiments/cfgs/faster_rcnn_end2end_resnet.yml --def models/vg/ResNet-101/faster_rcnn_end2end/test.prototxt --out test2014_resnet101_faster_rcnn_genome.tsv --net data/faster_rcnn_models/resnet101_faster_rcnn_final.caffemodel --split coco_test2014
+# ./tools/generate_npy.py --gpu 0,1,2,3,4,5,6,7 --cfg experiments/cfgs/faster_rcnn_end2end_resnet.yml --def models/vg/ResNet-101/faster_rcnn_end2end/test.prototxt --out test2014_resnet101_faster_rcnn_genome.tsv --net data/faster_rcnn_models/resnet101_faster_rcnn_final.caffemodel --split coco_test2014
 
 
 import _init_paths
@@ -32,12 +32,12 @@ import json
 csv.field_size_limit(sys.maxsize)
 
 
-FIELDNAMES = ['image_id', 'image_w','image_h','num_boxes', 'boxes', 'features', 'max_conf']
+FIELDNAMES = ['image_id', 'image_w','image_h','num_boxes', 'boxes', 'features']
 
 # Settings for the number of features per image. To re-create pretrained features with 36 features
 # per image, set both values to 36. 
-MIN_BOXES = 100 #36 #10
-MAX_BOXES = 100 #36 #100
+MIN_BOXES = 36 #10
+MAX_BOXES = 36 #100
 
 def load_image_ids(split_name):
     ''' Load a list of (path,image_id tuples). Modify this to suit your data locations. '''
@@ -56,9 +56,14 @@ def load_image_ids(split_name):
         valForTrainNum = len(valForTrainList)
         print "orgTrainNum = {}, valForTrainNum = {}".format(orgTrainNum, valForTrainNum)
         imgids = [int(l.rstrip()) for l in open(imgsetFile)]
-        imgids_train = [id for id in imgids if id in orgTrainList]
+        #imgids_train = [id for id in imgids if id in orgTrainList]
+        if 'train' in split_name:
+            imgids_train = orgTrainList
+            imgids_val = valForTrainList
+        else:
+            imgids_train = []
+            imgids_val = imgids
         print "imgids_train[:10] = {}".format(imgids_train[:10])
-        imgids_val = [id for id in imgids if id not in orgTrainList]
         print "imgids_val[:10] = {}".format(imgids_val[:10])
         imgs_train = []
         imgs_val = []
@@ -93,8 +98,8 @@ def load_image_ids(split_name):
             if len(split) % 100 == 0:
                 print len(split)
     elif split_name.startswith('flickr30k'):
-        if split_name == 'flickr30k_test':
-            imglist = [l.rstrip().split('\t') for l in open('./data/flickr30k/ImageSets/test.txt')]
+        if split_name == 'flickr30k_val':
+            imglist = [l.rstrip().split('\t') for l in open('./data/flickr30k/ImageSets/val.txt')]
         elif split_name == 'flickr30k_val':
             imglist = [l.rstrip().split('\t') for l in open('./data/flickr30k/ImageSets/val.txt')]
         elif split_name == 'flickr30k_train':
@@ -152,11 +157,10 @@ def get_detections_from_im(net, im_file, image_id, conf_thresh=0.2):
 
     cls_boxes = rois[:, 1:5] / im_scales[0]
     cls_prob = net.blobs['cls_prob'].data
-    #roipool5 = net.blobs['roipool5'].data
-    pool5 = net.blobs['pool5_flat'].data
+    roipool5 = net.blobs['roipool5'].data
 
     # Keep only the best detections
-    max_conf = np.zeros((rois.shape[0])).astype(np.float32)
+    max_conf = np.zeros((rois.shape[0]))
     for cls_ind in range(1,cls_prob.shape[1]):
         cls_scores = scores[:, cls_ind]
         dets = np.hstack((cls_boxes, cls_scores[:, np.newaxis])).astype(np.float32)
@@ -168,19 +172,16 @@ def get_detections_from_im(net, im_file, image_id, conf_thresh=0.2):
         keep_boxes = np.argsort(max_conf)[::-1][:MIN_BOXES]
     elif len(keep_boxes) > MAX_BOXES:
         keep_boxes = np.argsort(max_conf)[::-1][:MAX_BOXES]
-    print "feature dim = {}".format(pool5[keep_boxes].shape)
-    print "max_conf[keep_boxes] = {}, type = {}".format(max_conf[keep_boxes], type(max_conf[keep_boxes]))
-    print "max_conf shape = {}".format(max_conf.shape)
-    print "max_conf[keep_boxes] shape = {}".format(max_conf[keep_boxes].shape)
-    return {
-        'image_id': image_id,
-        'image_h': np.size(im, 0),
-        'image_w': np.size(im, 1),
-        'num_boxes' : len(keep_boxes),
-        'boxes': base64.b64encode(cls_boxes[keep_boxes]),
-        'features': base64.b64encode(pool5[keep_boxes]),
-        'max_conf': base64.b64encode(max_conf[keep_boxes])
-    }
+    print "feature dim = {}".format(roipool5[keep_boxes].shape)
+    return roipool5[keep_boxes]
+    # return {
+        # 'image_id': image_id,
+        # 'image_h': np.size(im, 0),
+        # 'image_w': np.size(im, 1),
+        # 'num_boxes' : len(keep_boxes),
+        # 'boxes': base64.b64encode(cls_boxes[keep_boxes]),
+        # 'features': base64.b64encode(roipool5[keep_boxes])
+    # }   
 
 
 def parse_args():
@@ -216,71 +217,77 @@ def parse_args():
     return args
 
     
-def generate_tsv(gpu_id, prototxt, weights, image_ids, outfile):
+def generate_npy(gpu_id, prototxt, weights, image_ids, outdir):
     # First check if file exists, and if it is complete
     wanted_ids = set([int(image_id[1]) for image_id in image_ids])
     found_ids = set()
-    outdir = osp.dirname(outfile)
+    #outdir = osp.dirname(outfile)
     print "outdir = {}".format(outdir)
     if not osp.isdir(outdir):
         os.makedirs(outdir)
     #else:
     #    print "rm {}".format(outfile)
     #    os.system("rm {}".format(outfile))
-    if os.path.exists(outfile):
-        existCnt = 0
-        print "Reading existing feature file: {}".format(outfile)
-        with open(outfile) as tsvfile:
-            reader = csv.DictReader(tsvfile, delimiter='\t', fieldnames = FIELDNAMES)
-            for item in reader:
-                found_ids.add(int(item['image_id']))
-                existCnt += 1
-                if (existCnt + 1) % 100 == 0:
-                    print existCnt+1
-    missing = wanted_ids - found_ids
-    if len(missing) == 0:
-        print 'GPU {:d}: already completed {:d}'.format(gpu_id, len(image_ids))
-    else:
-        print 'GPU {:d}: missing {:d}/{:d}'.format(gpu_id, len(missing), len(image_ids))
-    if len(missing) > 0:
-        caffe.set_mode_gpu()
-        caffe.set_device(gpu_id)
-        net = caffe.Net(prototxt, caffe.TEST, weights=weights)
-        with open(outfile, 'ab') as tsvfile:
-            writer = csv.DictWriter(tsvfile, delimiter = '\t', fieldnames = FIELDNAMES)   
-            _t = {'misc' : Timer()}
-            count = 0
-            for im_file,image_id in image_ids:
-                print "im_file = {}, image_id = {}".format(im_file, image_id)
-                if int(image_id) in missing:
-                    _t['misc'].tic()
-                    writer.writerow(get_detections_from_im(net, im_file, image_id))
-                    _t['misc'].toc()
-                    print "{}/{}".format(count+1, len(image_ids))
-                    if (count % 100) == 0:
-                        print 'GPU {:d}: {:d}/{:d} {:.3f}s (projected finish: {:.2f} hours)' \
-                              .format(gpu_id, count+1, len(missing), _t['misc'].average_time, 
-                              _t['misc'].average_time*(len(missing)-count)/3600)
-                    count += 1
+    # if os.path.exists(outfile):
+        # existCnt = 0
+        # print "Reading existing feature file: {}".format(outfile)
+        # with open(outfile) as tsvfile:
+            # reader = csv.DictReader(tsvfile, delimiter='\t', fieldnames = FIELDNAMES)
+            # for item in reader:
+                # found_ids.add(int(item['image_id']))
+                # existCnt += 1
+                # if (existCnt + 1) % 100 == 0:
+                    # print existCnt+1
+    # missing = wanted_ids - found_ids
+    # if len(missing) == 0:
+        # print 'GPU {:d}: already completed {:d}'.format(gpu_id, len(image_ids))
+    # else:
+        # print 'GPU {:d}: missing {:d}/{:d}'.format(gpu_id, len(missing), len(image_ids))
+    # if len(missing) > 0:
+    caffe.set_mode_gpu()
+    caffe.set_device(gpu_id)
+    net = caffe.Net(prototxt, caffe.TEST, weights=weights)
+    # with open(outfile, 'ab') as tsvfile:
+        # writer = csv.DictWriter(tsvfile, delimiter = '\t', fieldnames = FIELDNAMES)   
+    _t = {'misc' : Timer()}
+    count = 0
+    for im_file,image_id in image_ids:
+        imgName = osp.splitext(osp.basename(im_file))[0]
+        outfile = osp.join(outdir, str(image_id) + '.npy')
+        if osp.exists(outfile):
+            print "{} exists, continue!".format(outfile)
+            continue
+        print "im_file = {}, image_id = {}".format(im_file, image_id)
+
+        _t['misc'].tic()
+        feature = get_detections_from_im(net, im_file, image_id)
+        np.save(outfile, feature)
+        _t['misc'].toc()
+        print "{}/{}".format(count+1, len(image_ids))
+        if (count % 100) == 0:
+            print 'GPU {:d}: {:d}/{:d} {:.3f}s (projected finish: {:.2f} hours)' \
+                  .format(gpu_id, count+1, len(image_ids), _t['misc'].average_time, 
+                  _t['misc'].average_time*(len(image_ids)-count)/3600)
+        count += 1
 
                     
 
 
-def merge_tsvs():
-    test = ['/work/data/tsv/test2015/resnet101_faster_rcnn_final_test.tsv.%d' % i for i in range(8)]
+# def merge_tsvs():
+    # test = ['/work/data/tsv/test2015/resnet101_faster_rcnn_final_test.tsv.%d' % i for i in range(8)]
 
-    outfile = '/work/data/tsv/merged.tsv'
-    with open(outfile, 'ab') as tsvfile:
-        writer = csv.DictWriter(tsvfile, delimiter = '\t', fieldnames = FIELDNAMES)   
+    # outfile = '/work/data/tsv/merged.tsv'
+    # with open(outfile, 'ab') as tsvfile:
+        # writer = csv.DictWriter(tsvfile, delimiter = '\t', fieldnames = FIELDNAMES)   
         
-        for infile in test:
-            with open(infile) as tsv_in_file:
-                reader = csv.DictReader(tsv_in_file, delimiter='\t', fieldnames = FIELDNAMES)
-                for item in reader:
-                    try:
-                      writer.writerow(item)
-                    except Exception as e:
-                      print e                           
+        # for infile in test:
+            # with open(infile) as tsv_in_file:
+                # reader = csv.DictReader(tsv_in_file, delimiter='\t', fieldnames = FIELDNAMES)
+                # for item in reader:
+                    # try:
+                      # writer.writerow(item)
+                    # except Exception as e:
+                      # print e                           
 
                       
      
@@ -324,9 +331,12 @@ if __name__ == '__main__':
     procs = []    
     
     for i,gpu_id in enumerate(gpus):
-        outfile = '%s.%d' % (args.outfile, gpu_id)
-        p = Process(target=generate_tsv,
-                    args=(gpu_id, args.prototxt, args.caffemodel, gpu_image_ids[i], outfile))
+        #outfile = '%s.%d' % (args.outfile, gpu_id)
+        outfilePath = args.outfile
+        if not osp.isdir(outfilePath):
+            os.makedirs(outfilePath)
+        p = Process(target=generate_npy,
+                    args=(gpu_id, args.prototxt, args.caffemodel, gpu_image_ids[i], outfilePath))
         p.daemon = True
         p.start()
         procs.append(p)

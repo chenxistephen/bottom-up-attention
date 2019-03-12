@@ -12,7 +12,7 @@
 
 import _init_paths
 from fast_rcnn.config import cfg, cfg_from_file
-from fast_rcnn.test import im_detect,_get_blobs
+from fast_rcnn.test import im_extract_features,_get_blobs
 from fast_rcnn.nms_wrapper import nms
 from utils.timer import Timer
 
@@ -32,89 +32,22 @@ import json
 csv.field_size_limit(sys.maxsize)
 
 
-FIELDNAMES = ['image_id', 'image_w','image_h','num_boxes', 'boxes', 'features', 'max_conf']
+FIELDNAMES = ['image_id', 'image_w','image_h','num_boxes', 'boxes', 'features']
 
 # Settings for the number of features per image. To re-create pretrained features with 36 features
 # per image, set both values to 36. 
-MIN_BOXES = 100 #36 #10
-MAX_BOXES = 100 #36 #100
+MIN_BOXES = 36 #10
+MAX_BOXES = 36 #100
 
 def load_image_ids(split_name):
     ''' Load a list of (path,image_id tuples). Modify this to suit your data locations. '''
     split = []
-    if split_name.startswith('coco'): # COCO data
-        from pycocotools.coco import COCO
-        valAnnoFile = './data/coco/annotations/instances_val2014.json'
-        trainAnnoFile = './data/coco/annotations/instances_train2014.json'
-        if split_name == 'coco_dev':
-            imgsetFile = './data/coco/ImageSets/devall_uniq_ids.txt'
-        elif split_name == 'coco_train':
-            imgsetFile = './data/coco/ImageSets/train_ids.txt'
-        orgTrainList = [int(l.rstrip()) for l in open('./data/coco/ImageSets/train_sm_ids.txt')]
-        orgTrainNum = len(orgTrainList)        
-        valForTrainList = [int(l.rstrip()) for l in open('./data/coco/ImageSets/restval_ids.txt')]
-        valForTrainNum = len(valForTrainList)
-        print "orgTrainNum = {}, valForTrainNum = {}".format(orgTrainNum, valForTrainNum)
-        imgids = [int(l.rstrip()) for l in open(imgsetFile)]
-        imgids_train = [id for id in imgids if id in orgTrainList]
-        print "imgids_train[:10] = {}".format(imgids_train[:10])
-        imgids_val = [id for id in imgids if id not in orgTrainList]
-        print "imgids_val[:10] = {}".format(imgids_val[:10])
-        imgs_train = []
-        imgs_val = []
-        if len(imgids_train) > 0:
-            cocoTrain=COCO(trainAnnoFile)
-            imgs_train = cocoTrain.loadImgs(imgids_train)
-        if len(imgids_val) > 0:
-            cocoVal = COCO(valAnnoFile)
-            imgs_val = cocoVal.loadImgs(imgids_val)
-        
-
-
-
-        print "appending image_ids"
-        for image_id in imgids:
-            if image_id in orgTrainList:
-                idx = imgids_train.index(image_id)
-                img = imgs_train[idx]
-                filename = img['file_name']
-                filepath = './data/coco/train2014/'
-                filepath = osp.join(filepath, filename)
-                #print filepath
-                split.append((filepath,image_id))
-            else: # val
-                idx = imgids_val.index(image_id)
-                img = imgs_val[idx]
-                filename = img['file_name']
-                filepath = './data/coco/val2014/'
-                filepath = osp.join(filepath, filename)
-                #print filepath
-                split.append((filepath,image_id))
-            if len(split) % 100 == 0:
-                print len(split)
-    elif split_name.startswith('flickr30k'):
-        if split_name == 'flickr30k_test':
-            imglist = [l.rstrip().split('\t') for l in open('./data/flickr30k/ImageSets/test.txt')]
-        elif split_name == 'flickr30k_val':
-            imglist = [l.rstrip().split('\t') for l in open('./data/flickr30k/ImageSets/val.txt')]
-        elif split_name == 'flickr30k_train':
-            imglist = [l.rstrip().split('\t') for l in open('./data/flickr30k/ImageSets/train.txt')]
-        for img_name, image_id in imglist:
-            filepath = os.path.join('./data/flickr30k/flickr30k_images/', img_name)
-            print "filepath = {}, image_id = {}".format(filepath, image_id)
-            split.append((filepath,image_id))
-    # elif split_name == 'flickr30k_test':
-        # imglist = [l.rstrip().split('\t') for l in open('./data/flickr30k/ImageSets/test.txt')]
-        # for img_name, image_id in imglist:
-          # filepath = os.path.join('./data/flickr30k/flickr30k_images/', img_name)
-          # print filepath
-          # split.append((filepath,image_id))
-    # elif split_name == 'flickr30k_train':
-        # imglist = [l.rstrip().split('\t') for l in open('./data/flickr30k/ImageSets/train.txt')]
-        # for img_name, image_id in imglist[:50]:
-          # filepath = os.path.join('./data/flickr30k/flickr30k_images/', img_name)
-          # print filepath
-          # split.append((filepath,image_id))
+    if split_name == 'flickr30k':
+        imglist = [l.rstrip() for l in open('./data/flickr30k/imglist.txt')]
+        for image_id, img_name in enumerate(imglist):
+          filepath = os.path.join('./data/flickr30k/flickr30k_images/', img_name)
+          print filepath
+          split.append((filepath,image_id))
     elif split_name == 'coco_test2014':
       with open('/data/coco/annotations/image_info_test2014.json') as f:
         data = json.load(f)
@@ -141,46 +74,27 @@ def load_image_ids(split_name):
 
     
 def get_detections_from_im(net, im_file, image_id, conf_thresh=0.2):
-    print "get_detections_from_im: im_file = {}, image_id = {}".format(im_file, image_id)
+    print "get_detections_from_im"
+    print im_file
+    print image_id
     im = cv2.imread(im_file)
-    scores, boxes, attr_scores, rel_scores = im_detect(net, im)
+    features = im_extract_features(net, im)
+    print features.shape
 
     # Keep the original boxes, don't worry about the regresssion bbox outputs
-    rois = net.blobs['rois'].data.copy()
-    # unscale back to raw image space
-    blobs, im_scales = _get_blobs(im, None)
-
-    cls_boxes = rois[:, 1:5] / im_scales[0]
-    cls_prob = net.blobs['cls_prob'].data
-    #roipool5 = net.blobs['roipool5'].data
-    pool5 = net.blobs['pool5_flat'].data
-
-    # Keep only the best detections
-    max_conf = np.zeros((rois.shape[0])).astype(np.float32)
-    for cls_ind in range(1,cls_prob.shape[1]):
-        cls_scores = scores[:, cls_ind]
-        dets = np.hstack((cls_boxes, cls_scores[:, np.newaxis])).astype(np.float32)
-        keep = np.array(nms(dets, cfg.TEST.NMS))
-        max_conf[keep] = np.where(cls_scores[keep] > max_conf[keep], cls_scores[keep], max_conf[keep])
-
-    keep_boxes = np.where(max_conf >= conf_thresh)[0]
-    if len(keep_boxes) < MIN_BOXES:
-        keep_boxes = np.argsort(max_conf)[::-1][:MIN_BOXES]
-    elif len(keep_boxes) > MAX_BOXES:
-        keep_boxes = np.argsort(max_conf)[::-1][:MAX_BOXES]
-    print "feature dim = {}".format(pool5[keep_boxes].shape)
-    print "max_conf[keep_boxes] = {}, type = {}".format(max_conf[keep_boxes], type(max_conf[keep_boxes]))
-    print "max_conf shape = {}".format(max_conf.shape)
-    print "max_conf[keep_boxes] shape = {}".format(max_conf[keep_boxes].shape)
+    
+    OUTW = 14
+    OUTH = 14
+    DIM = 2048
+   
     return {
         'image_id': image_id,
         'image_h': np.size(im, 0),
         'image_w': np.size(im, 1),
-        'num_boxes' : len(keep_boxes),
-        'boxes': base64.b64encode(cls_boxes[keep_boxes]),
-        'features': base64.b64encode(pool5[keep_boxes]),
-        'max_conf': base64.b64encode(max_conf[keep_boxes])
-    }
+        'num_boxes' : OUTW*OUTH,
+        'boxes': base64.b64encode(np.arange(OUTW*OUTH)),
+        'features': base64.b64encode(features)
+    }   
 
 
 def parse_args():
@@ -218,25 +132,13 @@ def parse_args():
     
 def generate_tsv(gpu_id, prototxt, weights, image_ids, outfile):
     # First check if file exists, and if it is complete
-    wanted_ids = set([int(image_id[1]) for image_id in image_ids])
+    wanted_ids = set(image_ids) #set([int(image_id[1]) for image_id in image_ids])
     found_ids = set()
-    outdir = osp.dirname(outfile)
-    print "outdir = {}".format(outdir)
-    if not osp.isdir(outdir):
-        os.makedirs(outdir)
-    #else:
-    #    print "rm {}".format(outfile)
-    #    os.system("rm {}".format(outfile))
     if os.path.exists(outfile):
-        existCnt = 0
-        print "Reading existing feature file: {}".format(outfile)
         with open(outfile) as tsvfile:
             reader = csv.DictReader(tsvfile, delimiter='\t', fieldnames = FIELDNAMES)
             for item in reader:
                 found_ids.add(int(item['image_id']))
-                existCnt += 1
-                if (existCnt + 1) % 100 == 0:
-                    print existCnt+1
     missing = wanted_ids - found_ids
     if len(missing) == 0:
         print 'GPU {:d}: already completed {:d}'.format(gpu_id, len(image_ids))
@@ -251,12 +153,13 @@ def generate_tsv(gpu_id, prototxt, weights, image_ids, outfile):
             _t = {'misc' : Timer()}
             count = 0
             for im_file,image_id in image_ids:
-                print "im_file = {}, image_id = {}".format(im_file, image_id)
-                if int(image_id) in missing:
+                print im_file
+                print image_id
+                if True: #int(image_id) in missing:
                     _t['misc'].tic()
                     writer.writerow(get_detections_from_im(net, im_file, image_id))
                     _t['misc'].toc()
-                    print "{}/{}".format(count+1, len(image_ids))
+                    print "{}:{:.3f}".format(count, _t['misc'].average_time)
                     if (count % 100) == 0:
                         print 'GPU {:d}: {:d}/{:d} {:.3f}s (projected finish: {:.2f} hours)' \
                               .format(gpu_id, count+1, len(missing), _t['misc'].average_time, 
@@ -305,20 +208,11 @@ if __name__ == '__main__':
     assert cfg.TEST.HAS_RPN
 
     image_ids = load_image_ids(args.data_split)
-    # random.seed(10)
-    # random.shuffle(image_ids)
+    random.seed(10)
+    random.shuffle(image_ids)
     # Split image ids between gpus
-    #image_ids = [image_ids[i::len(gpus)] for i in range(len(gpus))]
-    gpu_image_ids = []
-    splen = np.ceil(len(image_ids)/float(len(gpus))).astype(int)
-    print "Split {} images for each of {} GPUS".format(splen, len(gpus))
-    for i in range(len(gpus)):
-        start = i * splen
-        end = min( (i+1) * splen, len(image_ids))
-        print range(start,end)
-        gpu_image_ids.append(image_ids[start:end])
-    # print gpu_image_ids
-    #sys.exit()
+    image_ids = [image_ids[i::len(gpus)] for i in range(len(gpus))]
+    
     caffe.init_log()
     caffe.log('Using devices %s' % str(gpus))
     procs = []    
@@ -326,7 +220,7 @@ if __name__ == '__main__':
     for i,gpu_id in enumerate(gpus):
         outfile = '%s.%d' % (args.outfile, gpu_id)
         p = Process(target=generate_tsv,
-                    args=(gpu_id, args.prototxt, args.caffemodel, gpu_image_ids[i], outfile))
+                    args=(gpu_id, args.prototxt, args.caffemodel, image_ids[i], outfile))
         p.daemon = True
         p.start()
         procs.append(p)
